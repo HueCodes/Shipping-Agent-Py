@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shipping Agent</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <div style="display: flex; align-items: center; gap: 0.75rem;">
+            <button class="mobile-sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle orders">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 12h18M3 6h18M3 18h18"/>
+                </svg>
+            </button>
+            <h1>Shipping Agent</h1>
+        </div>
+        <div class="header-right">
+            <span id="connection-badge" class="connection-badge disconnected">
+                <span class="dot"></span>
+                <span>Offline</span>
+            </span>
+            <span id="mode-badge" class="mode-badge">MOCK</span>
+            <button class="btn" onclick="resetChat()">Reset</button>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <!-- Orders Sidebar -->
+        <aside id="sidebar" class="sidebar collapsed">
+            <div class="sidebar-header">
+                <h2>Orders</h2>
+                <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Close sidebar">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M18 6L6 18M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+            <div id="sidebar-content" class="sidebar-content">
+                <div class="empty-orders">
+                    <p style="color: var(--text-dim); text-align: center; padding: 2rem;">
+                        Loading orders...
+                    </p>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Sidebar Overlay (mobile) -->
+        <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+        <!-- Chat Area -->
+        <div class="chat-area">
+            <div class="chat-container" id="chat-container">
+                <div class="message system">
+                    Ask me about shipping rates, address validation, or creating labels.
+                </div>
+            </div>
+
+            <div class="input-container">
+                <div class="input-wrapper">
+                    <input
+                        type="text"
+                        id="message-input"
+                        placeholder="Get rates for a 2lb package to Chicago..."
+                        autocomplete="off"
+                    >
+                    <button id="send-btn" class="btn btn-primary" onclick="sendMessage()">Send</button>
+                </div>
+                <div class="suggestions">
+                    <button class="suggestion" onclick="useSuggestion('Get rates for a 2lb package to Los Angeles, CA')">Rates to LA</button>
+                    <button class="suggestion" onclick="useSuggestion('How much to ship 32oz to Chicago?')">Rates to Chicago</button>
+                    <button class="suggestion" onclick="useSuggestion('Validate address: 123 Main St, Miami, FL 33101')">Validate address</button>
+                    <button class="suggestion" onclick="useSuggestion('What\\'s the cheapest overnight option to NYC?')">Overnight to NYC</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
