@@ -74,7 +74,14 @@ class Customer(Base):
     labels_limit = Column(Integer, default=50)
     easypost_api_key = Column(Text)
     default_from_address = Column(JSON)
-    shopify_access_token = Column(Text)
+
+    # Shopify OAuth fields
+    shopify_access_token = Column(Text)  # Encrypted access token
+    shopify_nonce = Column(String(64))  # CSRF protection for OAuth flow
+    shopify_scope = Column(Text)  # Granted OAuth scopes
+    installed_at = Column(DateTime)  # When app was installed
+    uninstalled_at = Column(DateTime)  # When app was uninstalled (soft delete)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
