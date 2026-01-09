@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 import json
 import asyncio
 from fastapi.staticfiles import StaticFiles
@@ -216,6 +217,23 @@ class UpdatePreferencesRequest(BaseModel):
     auto_cheapest: bool | None = None
 
 
+# OAuth models
+class OAuthStatusResponse(BaseModel):
+    """OAuth connection status."""
+    connected: bool
+    shop_domain: str | None = None
+    installed_at: str | None = None
+    scopes: list[str] | None = None
+
+
+class SessionTokenResponse(BaseModel):
+    """Session token response after OAuth."""
+    token: str
+    expires_in: int
+    customer_id: str
+    shop_domain: str
+
+
 # ============================================================================
 # Dependencies
 # ============================================================================
@@ -232,45 +250,105 @@ def get_db():
 
 def get_current_customer(
     x_customer_id: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
     db: Session = Depends(get_db),
 ):
-    """Get current customer from X-Customer-ID header."""
+    """Get current customer from JWT token or X-Customer-ID header.
+
+    Supports two authentication methods:
+    1. Authorization: Bearer <jwt_token> (preferred for OAuth flow)
+    2. X-Customer-ID: <uuid> (backward compatibility)
+    """
     from src.db.repository import CustomerRepository
 
-    if not x_customer_id:
-        raise HTTPException(status_code=401, detail="X-Customer-ID header required")
-
-    try:
-        customer_id = UUID(x_customer_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid customer ID format")
-
     customer_repo = CustomerRepository(db)
+    customer_id = None
+
+    # Try JWT authentication first
+    if authorization and authorization.startswith("Bearer "):
+        from src.auth.jwt import verify_session_token
+
+        token = authorization[7:]  # Remove "Bearer " prefix
+        session = verify_session_token(token)
+
+        if session:
+            try:
+                customer_id = UUID(session.customer_id)
+            except ValueError:
+                raise HTTPException(status_code=401, detail="Invalid session token")
+        else:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # Fall back to X-Customer-ID header
+    elif x_customer_id:
+        try:
+            customer_id = UUID(x_customer_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid customer ID format")
+
+    else:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Use Authorization header or X-Customer-ID.",
+        )
+
     customer = customer_repo.get_by_id(customer_id)
 
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Check if customer has been uninstalled
+    if customer.uninstalled_at:
+        raise HTTPException(status_code=403, detail="App has been uninstalled for this shop")
 
     return customer
 
 
 def get_optional_customer(
     x_customer_id: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
     db: Session = Depends(get_db),
 ):
-    """Get current customer if header provided, otherwise None."""
+    """Get current customer if authentication provided, otherwise None.
+
+    Supports JWT token or X-Customer-ID header.
+    """
     from src.db.repository import CustomerRepository
 
-    if not x_customer_id:
-        return None
-
-    try:
-        customer_id = UUID(x_customer_id)
-    except ValueError:
-        return None
-
     customer_repo = CustomerRepository(db)
-    return customer_repo.get_by_id(customer_id)
+    customer_id = None
+
+    # Try JWT authentication first
+    if authorization and authorization.startswith("Bearer "):
+        from src.auth.jwt import verify_session_token
+
+        token = authorization[7:]
+        session = verify_session_token(token)
+        if session:
+            try:
+                customer_id = UUID(session.customer_id)
+            except ValueError:
+                return None
+        else:
+            return None
+
+    # Fall back to X-Customer-ID header
+    elif x_customer_id:
+        try:
+            customer_id = UUID(x_customer_id)
+        except ValueError:
+            return None
+
+    if not customer_id:
+        return None
+
+    customer = customer_repo.get_by_id(customer_id)
+
+    # Return None if uninstalled
+    if customer and customer.uninstalled_at:
+        return None
+
+    return customer
 
 
 def get_easypost_client():
@@ -1055,6 +1133,214 @@ async def update_preferences(
     customer_repo.update(customer.id, {"default_from_address": current_address})
 
     return {"status": "ok"}
+
+
+# ============================================================================
+# Shopify OAuth API
+# ============================================================================
+
+@app.get("/auth/shopify")
+async def shopify_auth_start(
+    shop: str = Query(..., description="Shopify store domain (e.g., store.myshopify.com)"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    """Start Shopify OAuth flow.
+
+    Redirects the merchant to Shopify's authorization page.
+    """
+    from src.auth.shopify import ShopifyOAuth
+    from src.db.repository import CustomerRepository
+
+    try:
+        oauth = ShopifyOAuth()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth not configured: {e}. Set SHOPIFY_API_KEY and SHOPIFY_API_SECRET.",
+        )
+
+    # Validate shop domain
+    if not oauth.validate_shop_domain(shop):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid shop domain. Must be in format: store.myshopify.com",
+        )
+
+    # Generate nonce for CSRF protection
+    nonce = oauth.generate_nonce()
+
+    # Store nonce in database (create or update customer record)
+    customer_repo = CustomerRepository(db)
+    customer = customer_repo.get_by_shop_domain(shop)
+
+    if customer:
+        # Update existing customer with new nonce
+        customer_repo.update(customer.id, {"shopify_nonce": nonce})
+    else:
+        # Create placeholder customer record
+        customer = customer_repo.create({
+            "shop_domain": shop,
+            "name": shop.split(".")[0].title(),  # Temporary name from domain
+            "email": "",
+            "shopify_nonce": nonce,
+        })
+
+    # Build authorization URL and redirect
+    auth_url = oauth.get_authorization_url(shop, nonce)
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+@app.get("/auth/shopify/callback")
+async def shopify_auth_callback(
+    request: Request,
+    shop: str = Query(...),
+    code: str = Query(...),
+    state: str = Query(...),
+    hmac: str = Query(...),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    """Handle Shopify OAuth callback.
+
+    Exchanges authorization code for access token and creates session.
+    """
+    from src.auth.shopify import ShopifyOAuth, verify_hmac
+    from src.auth.crypto import encrypt_token
+    from src.auth.jwt import create_session_token
+    from src.db.repository import CustomerRepository
+
+    try:
+        oauth = ShopifyOAuth()
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"OAuth not configured: {e}")
+
+    # Verify HMAC signature
+    query_params = dict(request.query_params)
+    if not verify_hmac(query_params, oauth.config.api_secret):
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+
+    # Verify nonce matches
+    customer_repo = CustomerRepository(db)
+    customer = customer_repo.get_by_shop_domain(shop)
+
+    if not customer:
+        raise HTTPException(status_code=400, detail="Shop not found. Start OAuth flow again.")
+
+    if customer.shopify_nonce != state:
+        raise HTTPException(status_code=400, detail="Invalid state parameter (CSRF detected)")
+
+    # Exchange code for access token
+    try:
+        token_response = await oauth.exchange_code_for_token(shop, code)
+    except Exception as e:
+        logger.exception("Token exchange failed: %s", e)
+        raise HTTPException(status_code=502, detail="Failed to obtain access token from Shopify")
+
+    # Encrypt and store the access token
+    encrypted_token = encrypt_token(token_response.access_token)
+
+    # Update customer record
+    customer_repo.update(customer.id, {
+        "shopify_access_token": encrypted_token,
+        "shopify_scope": token_response.scope,
+        "shopify_nonce": None,  # Clear nonce after use
+        "installed_at": datetime.now(timezone.utc),
+        "uninstalled_at": None,  # Clear if reinstalling
+    })
+
+    # Create JWT session token
+    session_token = create_session_token(str(customer.id), shop)
+
+    # Redirect to app with token (in production, use secure cookie or fragment)
+    # For now, redirect to home with token in query param
+    redirect_url = f"/?token={session_token}&shop={shop}"
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@app.post("/webhooks/shopify/uninstall")
+async def shopify_uninstall_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Handle Shopify app/uninstalled webhook.
+
+    Clears customer access token and marks as uninstalled.
+    """
+    import os
+    from src.auth.shopify import verify_webhook_hmac
+    from src.db.repository import CustomerRepository
+
+    # Get webhook secret
+    webhook_secret = os.getenv("SHOPIFY_API_SECRET", "")
+
+    # Verify HMAC
+    body = await request.body()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+
+    if not verify_webhook_hmac(body, hmac_header, webhook_secret):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # Parse webhook payload
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    shop_domain = data.get("myshopify_domain") or data.get("domain")
+    if not shop_domain:
+        raise HTTPException(status_code=400, detail="Missing shop domain in webhook")
+
+    # Update customer record
+    customer_repo = CustomerRepository(db)
+    customer = customer_repo.get_by_shop_domain(shop_domain)
+
+    if customer:
+        customer_repo.update(customer.id, {
+            "shopify_access_token": None,
+            "shopify_scope": None,
+            "uninstalled_at": datetime.now(timezone.utc),
+        })
+        logger.info("App uninstalled for shop: %s", shop_domain)
+
+    return {"status": "ok"}
+
+
+@app.get("/api/oauth/status", response_model=OAuthStatusResponse)
+async def get_oauth_status(
+    customer=Depends(get_current_customer),
+) -> OAuthStatusResponse:
+    """Get OAuth connection status for current customer."""
+    from src.auth.crypto import decrypt_token
+
+    has_token = bool(customer.shopify_access_token and decrypt_token(customer.shopify_access_token))
+
+    scopes = None
+    if customer.shopify_scope:
+        scopes = [s.strip() for s in customer.shopify_scope.split(",")]
+
+    return OAuthStatusResponse(
+        connected=has_token,
+        shop_domain=customer.shop_domain,
+        installed_at=customer.installed_at.isoformat() if customer.installed_at else None,
+        scopes=scopes,
+    )
+
+
+@app.post("/api/oauth/refresh", response_model=SessionTokenResponse)
+async def refresh_oauth_token(
+    authorization: Annotated[str | None, Header()] = None,
+    customer=Depends(get_current_customer),
+) -> SessionTokenResponse:
+    """Refresh the JWT session token."""
+    from src.auth.jwt import create_session_token, DEFAULT_EXPIRATION_HOURS
+
+    token = create_session_token(str(customer.id), customer.shop_domain)
+
+    return SessionTokenResponse(
+        token=token,
+        expires_in=DEFAULT_EXPIRATION_HOURS * 3600,  # Convert to seconds
+        customer_id=str(customer.id),
+        shop_domain=customer.shop_domain,
+    )
 
 
 # ============================================================================
