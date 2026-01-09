@@ -10,9 +10,11 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
+import json
+import asyncio
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -40,6 +42,20 @@ class ChatResponse(BaseModel):
     """Chat response body."""
     response: str
     session_id: str
+
+
+class ChatMessage(BaseModel):
+    """A single chat message."""
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: str | None = None
+
+
+class ChatHistoryResponse(BaseModel):
+    """Chat history response."""
+    session_id: str
+    messages: list[ChatMessage]
+    total: int
 
 
 # Order models
@@ -150,6 +166,36 @@ class TrackingResponse(BaseModel):
     status: str
     estimated_delivery: str | None
     events: list[TrackingEventResponse]
+
+
+# Address validation models
+class ValidateAddressRequest(BaseModel):
+    """Address validation request."""
+    name: str | None = None
+    street1: str
+    street2: str | None = None
+    city: str
+    state: str
+    zip: str
+    country: str = "US"
+
+
+class StandardizedAddress(BaseModel):
+    """Standardized address."""
+    name: str | None
+    street1: str
+    street2: str | None
+    city: str
+    state: str
+    zip: str
+    country: str
+
+
+class ValidateAddressResponse(BaseModel):
+    """Address validation response."""
+    valid: bool
+    standardized: StandardizedAddress | None = None
+    message: str | None = None
 
 
 # Customer models
@@ -340,6 +386,205 @@ async def reset(
     if cache_key in agents:
         agents[cache_key].reset()
     return {"status": "ok", "session_id": cache_key}
+
+
+@app.get("/api/chat/history", response_model=ChatHistoryResponse)
+async def get_chat_history(
+    session_id: str = "default",
+    limit: int = 50,
+    customer=Depends(get_optional_customer),
+    db: Session = Depends(get_db),
+) -> ChatHistoryResponse:
+    """Get conversation history for a session."""
+    from src.db.repository import ConversationRepository
+
+    cache_key = str(customer.id) if customer else session_id
+
+    # Try to get from in-memory agent first
+    if cache_key in agents:
+        agent = agents[cache_key]
+        messages = agent.messages[-limit:] if limit else agent.messages
+    else:
+        # Fall back to database
+        if customer:
+            conversation_repo = ConversationRepository(db)
+            conversation = conversation_repo.get_or_create(customer.id)
+            messages = conversation_repo.get_messages(conversation.id, limit=limit)
+        else:
+            messages = []
+
+    # Convert messages to response format
+    chat_messages = []
+    for msg in messages:
+        content = msg.get("content", "")
+        # Handle content that might be a list (tool results)
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_result":
+                        text_parts.append(f"[Tool result: {block.get('content', '')}]")
+            content = "\n".join(text_parts)
+
+        chat_messages.append(ChatMessage(
+            role=msg.get("role", "unknown"),
+            content=content,
+            timestamp=msg.get("timestamp"),
+        ))
+
+    return ChatHistoryResponse(
+        session_id=cache_key,
+        messages=chat_messages,
+        total=len(chat_messages),
+    )
+
+
+@app.websocket("/api/chat/stream")
+async def chat_stream(websocket: WebSocket):
+    """WebSocket endpoint for streaming chat responses."""
+    from src.agent import ShippingAgent
+    from src.agent.context import CustomerContext
+    from src.db.database import get_db_session
+    from src.db.repository import CustomerRepository
+
+    await websocket.accept()
+
+    session_id = None
+    customer = None
+    agent = None
+
+    try:
+        while True:
+            # Receive message from client
+            data = await websocket.receive_text()
+            message_data = json.loads(data)
+
+            user_message = message_data.get("message", "")
+            session_id = message_data.get("session_id", "default")
+            customer_id = message_data.get("customer_id")
+
+            if not user_message.strip():
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Message cannot be empty",
+                })
+                continue
+
+            # Get or create agent
+            with get_db_session() as db:
+                cache_key = customer_id or session_id
+
+                # Load customer if provided
+                if customer_id:
+                    try:
+                        cid = UUID(customer_id)
+                        customer_repo = CustomerRepository(db)
+                        customer = customer_repo.get_by_id(cid)
+                    except (ValueError, Exception):
+                        customer = None
+
+                if cache_key not in agents:
+                    if customer:
+                        context = CustomerContext.from_customer(customer)
+                        agents[cache_key] = ShippingAgent(context=context, db=db)
+                    else:
+                        agents[cache_key] = ShippingAgent()
+
+                agent = agents[cache_key]
+
+                # Send thinking event
+                await websocket.send_json({
+                    "type": "status",
+                    "status": "thinking",
+                    "message": "Processing your request...",
+                })
+
+                # Process in mock mode (streaming simulation)
+                if agent.mock_mode:
+                    # Simulate thinking delay
+                    await asyncio.sleep(0.3)
+
+                    # Send tool execution event if it looks like a tool call
+                    lower_msg = user_message.lower()
+                    if any(term in lower_msg for term in ["rate", "ship", "track", "valid"]):
+                        tool_name = "get_shipping_rates"
+                        if "valid" in lower_msg:
+                            tool_name = "validate_address"
+                        elif "ship" in lower_msg:
+                            tool_name = "create_shipment"
+                        elif "track" in lower_msg:
+                            tool_name = "get_tracking_status"
+
+                        await websocket.send_json({
+                            "type": "tool_start",
+                            "tool": tool_name,
+                            "message": f"Executing {tool_name}...",
+                        })
+                        await asyncio.sleep(0.2)
+                        await websocket.send_json({
+                            "type": "tool_complete",
+                            "tool": tool_name,
+                            "message": f"{tool_name} completed",
+                        })
+
+                    # Get the response
+                    response = agent.chat(user_message)
+
+                    # Stream response in chunks (typewriter effect)
+                    await websocket.send_json({
+                        "type": "status",
+                        "status": "responding",
+                        "message": "Generating response...",
+                    })
+
+                    # Send response in chunks for typewriter effect
+                    chunk_size = 20
+                    for i in range(0, len(response), chunk_size):
+                        chunk = response[i:i + chunk_size]
+                        await websocket.send_json({
+                            "type": "chunk",
+                            "content": chunk,
+                        })
+                        await asyncio.sleep(0.02)  # Small delay between chunks
+
+                    # Send completion event
+                    await websocket.send_json({
+                        "type": "complete",
+                        "session_id": cache_key,
+                    })
+                else:
+                    # For real mode, use the synchronous chat for now
+                    # TODO: Implement true streaming with Claude API
+                    response = agent.chat(user_message)
+
+                    await websocket.send_json({
+                        "type": "chunk",
+                        "content": response,
+                    })
+                    await websocket.send_json({
+                        "type": "complete",
+                        "session_id": cache_key,
+                    })
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for session: %s", session_id)
+    except json.JSONDecodeError:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Invalid JSON",
+        })
+    except Exception as e:
+        logger.exception("WebSocket error: %s", e)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e),
+            })
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -541,6 +786,53 @@ async def get_rates(
     )
 
 
+@app.post("/api/addresses/validate", response_model=ValidateAddressResponse)
+async def validate_address(
+    request: ValidateAddressRequest,
+    customer=Depends(get_current_customer),
+) -> ValidateAddressResponse:
+    """Validate and standardize a shipping address."""
+    from src.easypost_client import Address
+
+    client = get_easypost_client()
+
+    address = Address(
+        name=request.name or "Recipient",
+        street1=request.street1,
+        street2=request.street2,
+        city=request.city,
+        state=request.state,
+        zip_code=request.zip,
+        country=request.country,
+    )
+
+    try:
+        is_valid, standardized, message = client.validate_address(address)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error validating address: {e}")
+
+    if is_valid and standardized:
+        return ValidateAddressResponse(
+            valid=True,
+            standardized=StandardizedAddress(
+                name=standardized.name,
+                street1=standardized.street1,
+                street2=standardized.street2,
+                city=standardized.city,
+                state=standardized.state,
+                zip=standardized.zip_code,
+                country=standardized.country or "US",
+            ),
+            message=message,
+        )
+    else:
+        return ValidateAddressResponse(
+            valid=False,
+            standardized=None,
+            message=message or "Address validation failed",
+        )
+
+
 @app.post("/api/shipments", response_model=ShipmentResponse)
 async def create_shipment(
     request: CreateShipmentRequest,
@@ -697,10 +989,17 @@ async def get_tracking(
 
     events = []
     for event in tracking.get("events", []):
+        # Handle location as string or dict
+        location = event.get("location")
+        if isinstance(location, str):
+            location = {"description": location}
+        elif location is None:
+            location = None
+
         events.append(TrackingEventResponse(
             status=event.get("status", ""),
             description=event.get("message", event.get("description", "")),
-            location=event.get("location"),
+            location=location,
             occurred_at=event.get("datetime", ""),
         ))
 
