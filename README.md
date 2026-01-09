@@ -1,89 +1,84 @@
-# Shipping AI Agent
+# Shipping Agent
 
-AI-powered shipping assistant. Natural language interface for rate shopping, address validation, and label generation.
+AI-powered shipping assistant for Shopify merchants. Natural language interface for rate shopping, label generation, and order fulfillment.
 
-## Status
+## Features
 
-**Phase 1**: CLI agent (current)
+- Claude-powered conversational interface
+- Multi-carrier rate comparison (USPS, UPS, FedEx via EasyPost)
+- Address validation and standardization
+- Label generation and tracking
+- Shopify OAuth integration
+- REST API and WebSocket streaming
 
 ## Quick Start
 
-### 1. Install dependencies
-
 ```bash
-cd ~/Dev/Shipping-Agent
+# Install
 uv sync
-```
 
-### 2. Set up API keys
-
-```bash
+# Configure
 cp .env.example .env
-# Edit .env with your keys
+# Edit .env with your API keys
+
+# Run server
+uv run ship-server
 ```
 
-You need:
-- **Anthropic API key**: https://console.anthropic.com
-- **EasyPost API key**: https://www.easypost.com/account/api-keys (use TEST key)
+Open http://localhost:8000
 
-### 3. Run the agent
+## Configuration
+
+Required environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `ANTHROPIC_API_KEY` | Claude API key |
+| `EASYPOST_API_KEY` | EasyPost API key (use TEST key for development) |
+| `SHOPIFY_API_KEY` | Shopify app API key |
+| `SHOPIFY_API_SECRET` | Shopify app secret |
+| `SECRET_KEY` | JWT signing key |
+
+See `.env.example` for full configuration options.
+
+## Development
 
 ```bash
+# Run in mock mode (no API calls)
+MOCK_MODE=1 uv run ship-server
+
+# Run tests
+MOCK_MODE=1 uv run pytest
+
+# CLI mode
 uv run ship
 ```
 
-Or:
+## API Endpoints
 
-```bash
-uv run python -m src.cli
-```
-
-## Usage Examples
-
-```
-You: Get rates for a 2lb package to Los Angeles, CA 90001
-
-Agent: Here are the available rates for shipping to Los Angeles, CA 90001:
-
-1. USPS Ground Advantage: $8.50 (5-7 days)
-2. UPS Ground: $12.30 (4-5 days)
-3. FedEx Ground: $11.85 (4-5 days)
-...
-
-You: Use the cheapest option
-
-Agent: I'll create a shipment with USPS Ground Advantage for $8.50.
-Please confirm the recipient details...
-```
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/chat` | POST | Send message to agent |
+| `/api/chat/stream` | WebSocket | Streaming chat |
+| `/api/rates` | POST | Get shipping rates |
+| `/api/shipments` | POST | Create shipment |
+| `/api/orders` | GET | List orders |
+| `/auth/shopify` | GET | Start OAuth flow |
 
 ## Project Structure
 
 ```
 src/
+  server.py           # FastAPI server
   cli.py              # CLI entry point
-  easypost_client.py  # EasyPost API wrapper
-  agent/
-    agent.py          # Claude agent with tool calling
-    tools.py          # Tool definitions
-docs/
-  PLAN.md             # Full project plan
-  ARCHITECTURE.md     # System design
-  AGENT_TOOLS.md      # Tool specifications
-  RESOURCES.md        # API links and references
+  agent/              # Claude agent and tools
+  auth/               # OAuth and JWT
+  db/                 # SQLAlchemy models and migrations
+  static/             # Web UI
+tests/
+  integration/        # Integration tests
 ```
 
-## Roadmap
+## License
 
-- [x] CLI agent with rate shopping
-- [x] Address validation
-- [x] Label generation
-- [ ] Web chat interface
-- [ ] Shopify integration
-- [ ] Tracking aggregation
-
-## Docs
-
-- [Project Plan](./docs/PLAN.md)
-- [Architecture](./docs/ARCHITECTURE.md)
-- [Agent Tools](./docs/AGENT_TOOLS.md)
-- [Resources](./docs/RESOURCES.md)
+MIT
