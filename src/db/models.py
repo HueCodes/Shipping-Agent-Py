@@ -82,6 +82,10 @@ class Customer(Base):
     installed_at = Column(DateTime)  # When app was installed
     uninstalled_at = Column(DateTime)  # When app was uninstalled (soft delete)
 
+    # Token validation fields
+    token_validated_at = Column(DateTime)  # Last time token was verified with Shopify
+    token_invalid = Column(Integer, default=0)  # Flag for invalid/revoked tokens (0=valid, 1=invalid)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
