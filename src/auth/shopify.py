@@ -256,3 +256,59 @@ def parse_shop_from_host(host: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+async def validate_access_token(shop: str, access_token: str) -> bool:
+    """Test if a Shopify access token is still valid.
+
+    Shopify offline access tokens don't expire, but can be revoked when:
+    - Merchant uninstalls/reinstalls app
+    - Merchant changes permissions
+    - Shopify rotates tokens (rare)
+
+    This function makes a lightweight API call to verify the token works.
+
+    Args:
+        shop: Shopify store domain (e.g., store.myshopify.com)
+        access_token: The access token to validate
+
+    Returns:
+        True if token is valid and working, False otherwise
+    """
+    if not shop or not access_token:
+        return False
+
+    # Validate shop domain format
+    if not ShopifyOAuth.validate_shop_domain(shop):
+        return False
+
+    # Use the shop.json endpoint as a lightweight validation call
+    url = f"https://{shop}/admin/api/2024-01/shop.json"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+            )
+
+            # 200 = valid token
+            # 401/403 = invalid or revoked token
+            # Other errors = network issues, treat as unknown
+            if response.status_code == 200:
+                return True
+            elif response.status_code in (401, 403):
+                return False
+            else:
+                # For other errors (5xx, network issues), we can't determine
+                # validity - return True to avoid false negatives
+                return True
+    except httpx.TimeoutException:
+        # Timeout - can't determine, assume valid to avoid false negatives
+        return True
+    except Exception:
+        # Network or other error - can't determine, assume valid
+        return True
