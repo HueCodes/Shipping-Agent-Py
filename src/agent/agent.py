@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, TYPE_CHECKING
+from collections.abc import AsyncIterator
+from typing import Any, TYPE_CHECKING, TypedDict
 
 from .context import CustomerContext
 from .tools import TOOLS, ToolExecutor
@@ -24,6 +25,16 @@ CHARS_PER_TOKEN = 4
 MAX_CONVERSATION_TOKENS = 50000
 SUMMARIZE_THRESHOLD_TOKENS = 50000
 KEEP_RECENT_TURNS = 5
+
+
+class StreamEvent(TypedDict, total=False):
+    """Event emitted during streaming chat."""
+
+    type: str  # "text", "tool_start", "tool_complete", "error", "complete"
+    content: str
+    tool: str
+    tool_input: dict[str, Any]
+    tool_result: str
 
 SYSTEM_PROMPT_TEMPLATE = """You are a shipping assistant for {store_name}. You help the merchant manage their shipping operations through natural conversation.
 
@@ -87,6 +98,7 @@ class ShippingAgent:
             from src.mock import MockEasyPostClient
             self.easypost = MockEasyPostClient()
             self.client = None  # No Claude client needed in mock mode
+            self.async_client = None
         else:
             import anthropic
             from src.easypost_client import EasyPostClient
@@ -96,6 +108,7 @@ class ShippingAgent:
                 raise ValueError("ANTHROPIC_API_KEY not set. Use MOCK_MODE=1 to test without API keys.")
 
             self.client = anthropic.Anthropic(api_key=api_key)
+            self.async_client = anthropic.AsyncAnthropic(api_key=api_key)
             self.easypost = EasyPostClient()
 
         self.executor = ToolExecutor(self.easypost, context=self.context, db=db)
@@ -450,3 +463,192 @@ class ShippingAgent:
         # Clear database conversation if available
         if self.conversation_repo and self.conversation_id:
             self.conversation_repo.clear_messages(self.conversation_id)
+
+    async def chat_stream(self, user_message: str) -> AsyncIterator[StreamEvent]:
+        """Stream a chat response with real-time text and tool events.
+
+        Yields StreamEvent dictionaries with types:
+        - "text": Incremental text content
+        - "tool_start": Tool execution starting
+        - "tool_complete": Tool execution finished with result
+        - "error": An error occurred
+        - "complete": Response fully complete
+        """
+        if self.mock_mode:
+            # In mock mode, yield the full response as a single text event
+            response = self._mock_chat(user_message)
+            yield StreamEvent(type="text", content=response)
+            yield StreamEvent(type="complete", content="")
+            return
+
+        async for event in self._real_chat_stream(user_message):
+            yield event
+
+    async def _real_chat_stream(self, user_message: str) -> AsyncIterator[StreamEvent]:
+        """Stream chat with real Claude API using async client."""
+        import anthropic
+
+        self.messages.append({"role": "user", "content": user_message})
+        self._maybe_summarize()
+
+        accumulated_text = ""
+
+        try:
+            while True:
+                # Track content blocks as they stream in
+                current_text = ""
+                tool_calls: list[dict[str, Any]] = []
+                current_tool: dict[str, Any] | None = None
+
+                try:
+                    async with self.async_client.messages.stream(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1024,
+                        system=self.system_prompt,
+                        tools=TOOLS,
+                        messages=self.messages,
+                    ) as stream:
+                        async for event in stream:
+                            if event.type == "content_block_start":
+                                block = event.content_block
+                                if block.type == "tool_use":
+                                    current_tool = {
+                                        "id": block.id,
+                                        "name": block.name,
+                                        "input_json": "",
+                                    }
+                                    yield StreamEvent(
+                                        type="tool_start",
+                                        tool=block.name,
+                                    )
+
+                            elif event.type == "content_block_delta":
+                                delta = event.delta
+                                if delta.type == "text_delta":
+                                    current_text += delta.text
+                                    accumulated_text += delta.text
+                                    yield StreamEvent(type="text", content=delta.text)
+                                elif delta.type == "input_json_delta" and current_tool:
+                                    current_tool["input_json"] += delta.partial_json
+
+                            elif event.type == "content_block_stop":
+                                if current_tool:
+                                    # Parse accumulated JSON for tool input
+                                    import json
+                                    try:
+                                        tool_input = json.loads(current_tool["input_json"])
+                                    except json.JSONDecodeError:
+                                        tool_input = {}
+                                    current_tool["input"] = tool_input
+                                    tool_calls.append(current_tool)
+                                    current_tool = None
+
+                        # Get final message for stop reason
+                        final_message = await stream.get_final_message()
+
+                except anthropic.RateLimitError as e:
+                    logger.error("Anthropic rate limit exceeded: %s", e)
+                    yield StreamEvent(
+                        type="error",
+                        content="I'm currently experiencing high demand. Please try again in a moment.",
+                    )
+                    return
+                except anthropic.APIStatusError as e:
+                    logger.error("Anthropic API error: %s", e)
+                    yield StreamEvent(type="error", content=f"API error: {e.message}")
+                    return
+                except anthropic.APITimeoutError as e:
+                    logger.error("Anthropic API timeout: %s", e)
+                    yield StreamEvent(
+                        type="error",
+                        content="The request timed out. Please try again.",
+                    )
+                    return
+                except anthropic.APIConnectionError as e:
+                    logger.error("Anthropic connection error: %s", e)
+                    yield StreamEvent(
+                        type="error",
+                        content="Connection error. Please check your network.",
+                    )
+                    return
+
+                # Check if we need to handle tool calls
+                if final_message.stop_reason == "tool_use":
+                    # Add assistant message with tool calls
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": final_message.content,
+                    })
+
+                    # Execute tools and collect results
+                    tool_results = []
+                    for tool_call in tool_calls:
+                        try:
+                            result = self.executor.execute(
+                                tool_call["name"],
+                                tool_call["input"],
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Tool execution failed for '%s': %s",
+                                tool_call["name"],
+                                e,
+                            )
+                            result = f"Error: Tool '{tool_call['name']}' failed: {e}"
+
+                        yield StreamEvent(
+                            type="tool_complete",
+                            tool=tool_call["name"],
+                            tool_result=result,
+                        )
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_call["id"],
+                            "content": result,
+                        })
+
+                    # Add tool results to messages
+                    self.messages.append({"role": "user", "content": tool_results})
+                    # Continue loop to get Claude's response to tool results
+                else:
+                    # No more tool calls - complete
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": final_message.content,
+                    })
+
+                    # Persist messages
+                    self._persist_conversation()
+
+                    yield StreamEvent(type="complete", content="")
+                    return
+
+        except Exception as e:
+            logger.error("Unexpected error in stream: %s", e, exc_info=True)
+            yield StreamEvent(type="error", content=f"Unexpected error: {e}")
+
+    def _persist_conversation(self) -> None:
+        """Persist current messages to database."""
+        if not self.conversation_repo or not self.conversation_id:
+            return
+
+        serializable_messages = []
+        for msg in self.messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Convert Anthropic content blocks to dicts
+                serialized_content = []
+                for b in content:
+                    if hasattr(b, "model_dump"):
+                        serialized_content.append(b.model_dump())
+                    elif hasattr(b, "__dict__"):
+                        serialized_content.append(dict(b))
+                    else:
+                        serialized_content.append(b)
+                content = serialized_content
+            serializable_messages.append({
+                "role": msg["role"],
+                "content": content,
+            })
+        self.conversation_repo.set_messages(self.conversation_id, serializable_messages)
