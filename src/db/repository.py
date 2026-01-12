@@ -63,6 +63,31 @@ class CustomerRepository:
         """List all customers."""
         return self.db.query(Customer).limit(limit).all()
 
+    def mark_token_invalid(self, id: UUID) -> None:
+        """Mark a customer's Shopify token as invalid."""
+        customer = self.get_by_id(id)
+        if customer:
+            customer.token_invalid = 1
+            customer.updated_at = datetime.utcnow()
+            self.db.commit()
+
+    def mark_token_valid(self, id: UUID) -> None:
+        """Mark a customer's Shopify token as valid and update validated timestamp."""
+        customer = self.get_by_id(id)
+        if customer:
+            customer.token_invalid = 0
+            customer.token_validated_at = datetime.utcnow()
+            customer.updated_at = datetime.utcnow()
+            self.db.commit()
+
+    def update_token_validated_at(self, id: UUID) -> None:
+        """Update the token_validated_at timestamp."""
+        customer = self.get_by_id(id)
+        if customer:
+            customer.token_validated_at = datetime.utcnow()
+            customer.updated_at = datetime.utcnow()
+            self.db.commit()
+
 
 class OrderRepository:
     """Repository for order data access."""
