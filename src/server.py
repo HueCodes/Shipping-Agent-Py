@@ -33,6 +33,98 @@ agents: dict[str, "ShippingAgent"] = {}
 # ============================================================================
 
 # Chat models
+# ============================================================================
+# Error Response Schema
+# ============================================================================
+
+class ErrorResponse(BaseModel):
+    """Consistent error response format for all API errors."""
+    error: str  # User-friendly message
+    code: str   # Machine-readable error code (e.g., "EASYPOST_RATE_ERROR")
+    detail: str | None = None  # Optional technical detail for debugging
+
+
+# Error codes
+class ErrorCode:
+    """Machine-readable error codes."""
+    # General errors
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    NOT_FOUND = "NOT_FOUND"
+    ACCESS_DENIED = "ACCESS_DENIED"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+    # Auth errors
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    INVALID_TOKEN = "INVALID_TOKEN"
+    TOKEN_EXPIRED = "TOKEN_EXPIRED"
+    SHOPIFY_TOKEN_INVALID = "SHOPIFY_TOKEN_INVALID"
+
+    # EasyPost errors
+    EASYPOST_RATE_ERROR = "EASYPOST_RATE_ERROR"
+    EASYPOST_SHIPMENT_ERROR = "EASYPOST_SHIPMENT_ERROR"
+    EASYPOST_TRACKING_ERROR = "EASYPOST_TRACKING_ERROR"
+    EASYPOST_ADDRESS_ERROR = "EASYPOST_ADDRESS_ERROR"
+
+    # Claude API errors
+    CLAUDE_API_ERROR = "CLAUDE_API_ERROR"
+    CLAUDE_TIMEOUT = "CLAUDE_TIMEOUT"
+
+    # Shopify errors
+    SHOPIFY_API_ERROR = "SHOPIFY_API_ERROR"
+
+    # Database errors
+    DATABASE_ERROR = "DATABASE_ERROR"
+
+
+def create_error_response(
+    status_code: int,
+    error: str,
+    code: str,
+    detail: str | None = None,
+    customer_id: str | None = None,
+    endpoint: str | None = None,
+    exc: Exception | None = None,
+) -> HTTPException:
+    """Create a consistent error response with logging.
+
+    Args:
+        status_code: HTTP status code
+        error: User-friendly error message
+        code: Machine-readable error code
+        detail: Optional technical detail (safe for user)
+        customer_id: Customer ID for logging context
+        endpoint: Endpoint name for logging context
+        exc: Original exception for server-side logging
+
+    Returns:
+        HTTPException with consistent error format
+    """
+    # Log the error with context (full traceback for server logs only)
+    log_context = {
+        "error_code": code,
+        "customer_id": customer_id,
+        "endpoint": endpoint,
+    }
+
+    if exc:
+        logger.exception(
+            "API error: %s (code=%s, customer=%s, endpoint=%s)",
+            error, code, customer_id, endpoint,
+            extra=log_context,
+        )
+    else:
+        logger.warning(
+            "API error: %s (code=%s, customer=%s, endpoint=%s)",
+            error, code, customer_id, endpoint,
+            extra=log_context,
+        )
+
+    return HTTPException(
+        status_code=status_code,
+        detail=ErrorResponse(error=error, code=code, detail=detail).model_dump(),
+    )
+
+
 class ChatRequest(BaseModel):
     """Chat request body."""
     message: str
@@ -258,6 +350,8 @@ def get_current_customer(
     Supports two authentication methods:
     1. Authorization: Bearer <jwt_token> (preferred for OAuth flow)
     2. X-Customer-ID: <uuid> (backward compatibility)
+
+    Also checks for invalid Shopify tokens and prompts re-authentication.
     """
     from src.db.repository import CustomerRepository
 
@@ -300,6 +394,17 @@ def get_current_customer(
     # Check if customer has been uninstalled
     if customer.uninstalled_at:
         raise HTTPException(status_code=403, detail="App has been uninstalled for this shop")
+
+    # Check if Shopify token has been marked as invalid
+    if getattr(customer, "token_invalid", 0) == 1:
+        raise create_error_response(
+            status_code=401,
+            error="Your Shopify connection has expired. Please reconnect your store.",
+            code=ErrorCode.SHOPIFY_TOKEN_INVALID,
+            customer_id=str(customer_id),
+            endpoint="auth",
+            detail="Use /api/shopify/reconnect to re-authenticate",
+        )
 
     return customer
 
@@ -433,7 +538,14 @@ async def chat(
     from src.agent.context import CustomerContext
 
     if not request.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        raise create_error_response(
+            status_code=400,
+            error="Message cannot be empty",
+            code=ErrorCode.VALIDATION_ERROR,
+            endpoint="/api/chat",
+        )
+
+    customer_id_str = str(customer.id) if customer else None
 
     try:
         # Create agent with customer context if available
@@ -449,9 +561,35 @@ async def chat(
         agent = agents[cache_key]
         response = agent.chat(request.message)
         return ChatResponse(response=response, session_id=cache_key)
+    except TimeoutError as e:
+        raise create_error_response(
+            status_code=504,
+            error="The AI assistant is taking too long to respond. Please try again.",
+            code=ErrorCode.CLAUDE_TIMEOUT,
+            customer_id=customer_id_str,
+            endpoint="/api/chat",
+            exc=e,
+        )
     except Exception as e:
-        logger.exception("Chat error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Check if it's a Claude API error
+        error_str = str(e).lower()
+        if "anthropic" in error_str or "claude" in error_str or "api" in error_str:
+            raise create_error_response(
+                status_code=502,
+                error="Unable to connect to the AI assistant. Please try again later.",
+                code=ErrorCode.CLAUDE_API_ERROR,
+                customer_id=customer_id_str,
+                endpoint="/api/chat",
+                exc=e,
+            )
+        raise create_error_response(
+            status_code=500,
+            error="An error occurred while processing your message. Please try again.",
+            code=ErrorCode.INTERNAL_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/chat",
+            exc=e,
+        )
 
 
 @app.post("/api/reset")
@@ -634,32 +772,60 @@ async def chat_stream(websocket: WebSocket):
                         "session_id": cache_key,
                     })
                 else:
-                    # For real mode, use the synchronous chat for now
-                    # TODO: Implement true streaming with Claude API
-                    response = agent.chat(user_message)
+                    # Real mode: use true streaming with Claude API
+                    await websocket.send_json({
+                        "type": "status",
+                        "status": "responding",
+                        "message": "Generating response...",
+                    })
 
-                    await websocket.send_json({
-                        "type": "chunk",
-                        "content": response,
-                    })
-                    await websocket.send_json({
-                        "type": "complete",
-                        "session_id": cache_key,
-                    })
+                    async for event in agent.chat_stream(user_message):
+                        event_type = event.get("type")
+
+                        if event_type == "text":
+                            await websocket.send_json({
+                                "type": "chunk",
+                                "content": event.get("content", ""),
+                            })
+                        elif event_type == "tool_start":
+                            await websocket.send_json({
+                                "type": "tool_start",
+                                "tool": event.get("tool", ""),
+                                "message": f"Executing {event.get('tool', '')}...",
+                            })
+                        elif event_type == "tool_complete":
+                            await websocket.send_json({
+                                "type": "tool_complete",
+                                "tool": event.get("tool", ""),
+                                "message": f"{event.get('tool', '')} completed",
+                            })
+                        elif event_type == "error":
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": event.get("content", "Unknown error"),
+                            })
+                        elif event_type == "complete":
+                            await websocket.send_json({
+                                "type": "complete",
+                                "session_id": cache_key,
+                            })
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for session: %s", session_id)
     except json.JSONDecodeError:
         await websocket.send_json({
             "type": "error",
-            "message": "Invalid JSON",
+            "code": ErrorCode.VALIDATION_ERROR,
+            "message": "Invalid JSON format",
         })
     except Exception as e:
-        logger.exception("WebSocket error: %s", e)
+        logger.exception("WebSocket error for session %s: %s", session_id, e)
         try:
+            # Send user-friendly error, not raw exception
             await websocket.send_json({
                 "type": "error",
-                "message": str(e),
+                "code": ErrorCode.INTERNAL_ERROR,
+                "message": "An error occurred while processing your request. Please try again.",
             })
         except Exception:
             pass
@@ -796,8 +962,9 @@ async def get_rates(
 ) -> RatesResponse:
     """Get shipping rates for an order or address."""
     from src.db.repository import OrderRepository
-    from src.easypost_client import Address, Parcel
+    from src.easypost_client import Address, Parcel, RateError
 
+    customer_id_str = str(customer.id)
     client = get_easypost_client()
 
     # Get address from order or request
@@ -805,13 +972,25 @@ async def get_rates(
         try:
             oid = UUID(request.order_id)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid order ID format")
+            raise create_error_response(
+                status_code=400,
+                error="Invalid order ID format",
+                code=ErrorCode.VALIDATION_ERROR,
+                customer_id=customer_id_str,
+                endpoint="/api/rates",
+            )
 
         order_repo = OrderRepository(db)
         order = order_repo.get_by_id(oid)
 
         if not order or order.customer_id != customer.id:
-            raise HTTPException(status_code=404, detail="Order not found")
+            raise create_error_response(
+                status_code=404,
+                error="Order not found",
+                code=ErrorCode.NOT_FOUND,
+                customer_id=customer_id_str,
+                endpoint="/api/rates",
+            )
 
         addr = order.shipping_address or {}
         to_address = Address(
@@ -824,9 +1003,12 @@ async def get_rates(
         weight_oz = order.weight_oz or 16
     else:
         if not all([request.to_city, request.to_state, request.to_zip, request.weight_oz]):
-            raise HTTPException(
+            raise create_error_response(
                 status_code=400,
-                detail="Either order_id or (to_city, to_state, to_zip, weight_oz) required",
+                error="Either order_id or (to_city, to_state, to_zip, weight_oz) required",
+                code=ErrorCode.VALIDATION_ERROR,
+                customer_id=customer_id_str,
+                endpoint="/api/rates",
             )
 
         to_address = Address(
@@ -847,8 +1029,24 @@ async def get_rates(
 
     try:
         rates = client.get_rates(to_address, parcel)
+    except RateError as e:
+        raise create_error_response(
+            status_code=502,
+            error=e.message,
+            code=ErrorCode.EASYPOST_RATE_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/rates",
+            exc=e,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting rates: {e}")
+        raise create_error_response(
+            status_code=500,
+            error="Unable to fetch shipping rates. Please try again.",
+            code=ErrorCode.EASYPOST_RATE_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/rates",
+            exc=e,
+        )
 
     return RatesResponse(
         rates=[
@@ -870,8 +1068,9 @@ async def validate_address(
     customer=Depends(get_current_customer),
 ) -> ValidateAddressResponse:
     """Validate and standardize a shipping address."""
-    from src.easypost_client import Address
+    from src.easypost_client import Address, AddressValidationError
 
+    customer_id_str = str(customer.id)
     client = get_easypost_client()
 
     address = Address(
@@ -886,8 +1085,24 @@ async def validate_address(
 
     try:
         is_valid, standardized, message = client.validate_address(address)
+    except AddressValidationError as e:
+        raise create_error_response(
+            status_code=502,
+            error=e.message,
+            code=ErrorCode.EASYPOST_ADDRESS_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/addresses/validate",
+            exc=e,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error validating address: {e}")
+        raise create_error_response(
+            status_code=500,
+            error="Unable to validate address. Please try again.",
+            code=ErrorCode.EASYPOST_ADDRESS_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/addresses/validate",
+            exc=e,
+        )
 
     if is_valid and standardized:
         return ValidateAddressResponse(
@@ -919,8 +1134,9 @@ async def create_shipment(
 ) -> ShipmentResponse:
     """Create a shipment and purchase a label."""
     from src.db.repository import OrderRepository, ShipmentRepository, CustomerRepository
-    from src.easypost_client import Address, Parcel
+    from src.easypost_client import Address, Parcel, ShipmentError
 
+    customer_id_str = str(customer.id)
     client = get_easypost_client()
     order_repo = OrderRepository(db)
     shipment_repo = ShipmentRepository(db)
@@ -932,17 +1148,32 @@ async def create_shipment(
         try:
             order_id = UUID(request.order_id)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid order ID format")
+            raise create_error_response(
+                status_code=400,
+                error="Invalid order ID format",
+                code=ErrorCode.VALIDATION_ERROR,
+                customer_id=customer_id_str,
+                endpoint="/api/shipments",
+            )
 
         order = order_repo.get_by_id(order_id)
         if not order or order.customer_id != customer.id:
-            raise HTTPException(status_code=404, detail="Order not found")
+            raise create_error_response(
+                status_code=404,
+                error="Order not found",
+                code=ErrorCode.NOT_FOUND,
+                customer_id=customer_id_str,
+                endpoint="/api/shipments",
+            )
 
     # Check label limit
     if customer.labels_this_month >= customer.labels_limit:
-        raise HTTPException(
+        raise create_error_response(
             status_code=403,
-            detail=f"Label limit reached ({customer.labels_limit}/month). Upgrade your plan.",
+            error=f"Label limit reached ({customer.labels_limit}/month). Upgrade your plan.",
+            code=ErrorCode.ACCESS_DENIED,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments",
         )
 
     to_address = Address(
@@ -961,8 +1192,24 @@ async def create_shipment(
 
     try:
         shipment = client.create_shipment(to_address, parcel, request.rate_id)
+    except ShipmentError as e:
+        raise create_error_response(
+            status_code=502,
+            error=e.message,
+            code=ErrorCode.EASYPOST_SHIPMENT_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments",
+            exc=e,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating shipment: {e}")
+        raise create_error_response(
+            status_code=500,
+            error="Unable to create shipment. Please try again.",
+            code=ErrorCode.EASYPOST_SHIPMENT_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments",
+            exc=e,
+        )
 
     # Save to database
     db_shipment = shipment_repo.create({
@@ -1043,27 +1290,64 @@ async def get_tracking(
 ) -> TrackingResponse:
     """Get tracking events for a shipment."""
     from src.db.repository import ShipmentRepository
+    from src.easypost_client import TrackingError
+
+    customer_id_str = str(customer.id)
 
     try:
         sid = UUID(shipment_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid shipment ID format")
+        raise create_error_response(
+            status_code=400,
+            error="Invalid shipment ID format",
+            code=ErrorCode.VALIDATION_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments/{id}/tracking",
+        )
 
     shipment_repo = ShipmentRepository(db)
     shipment = shipment_repo.get_by_id(sid)
 
     if not shipment:
-        raise HTTPException(status_code=404, detail="Shipment not found")
+        raise create_error_response(
+            status_code=404,
+            error="Shipment not found",
+            code=ErrorCode.NOT_FOUND,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments/{id}/tracking",
+        )
 
     if shipment.customer_id != customer.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+        raise create_error_response(
+            status_code=403,
+            error="Access denied",
+            code=ErrorCode.ACCESS_DENIED,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments/{id}/tracking",
+        )
 
     # Get live tracking from carrier
     client = get_easypost_client()
     try:
         tracking = client.get_tracking(shipment.tracking_number, shipment.carrier)
+    except TrackingError as e:
+        raise create_error_response(
+            status_code=502,
+            error=e.message,
+            code=ErrorCode.EASYPOST_TRACKING_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments/{id}/tracking",
+            exc=e,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting tracking: {e}")
+        raise create_error_response(
+            status_code=500,
+            error="Unable to fetch tracking information. Please try again.",
+            code=ErrorCode.EASYPOST_TRACKING_ERROR,
+            customer_id=customer_id_str,
+            endpoint="/api/shipments/{id}/tracking",
+            exc=e,
+        )
 
     events = []
     for event in tracking.get("events", []):
@@ -1245,6 +1529,8 @@ async def shopify_auth_callback(
         "shopify_nonce": None,  # Clear nonce after use
         "installed_at": datetime.now(timezone.utc),
         "uninstalled_at": None,  # Clear if reinstalling
+        "token_validated_at": datetime.now(timezone.utc),  # Token just validated
+        "token_invalid": 0,  # Clear invalid flag on successful re-auth
     })
 
     # Create JWT session token
@@ -1341,6 +1627,76 @@ async def refresh_oauth_token(
         customer_id=str(customer.id),
         shop_domain=customer.shop_domain,
     )
+
+
+@app.get("/api/shopify/reconnect")
+async def shopify_reconnect(
+    x_customer_id: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    """Initiate re-authentication flow for expired Shopify token.
+
+    This endpoint bypasses the normal token_invalid check to allow
+    customers with invalid tokens to re-authenticate.
+    """
+    from src.auth.shopify import ShopifyOAuth
+    from src.db.repository import CustomerRepository
+
+    customer_repo = CustomerRepository(db)
+    customer_id = None
+
+    # Get customer ID from auth (without the token_invalid check)
+    if authorization and authorization.startswith("Bearer "):
+        from src.auth.jwt import verify_session_token
+
+        token = authorization[7:]
+        session = verify_session_token(token)
+        if session:
+            try:
+                customer_id = UUID(session.customer_id)
+            except ValueError:
+                raise HTTPException(status_code=401, detail="Invalid session token")
+        else:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+    elif x_customer_id:
+        try:
+            customer_id = UUID(x_customer_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid customer ID format")
+    else:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required to reconnect",
+        )
+
+    customer = customer_repo.get_by_id(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Get the shop domain to start OAuth flow
+    shop = customer.shop_domain
+    if not shop:
+        raise HTTPException(
+            status_code=400,
+            detail="No shop domain associated with this customer",
+        )
+
+    try:
+        oauth = ShopifyOAuth()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth not configured: {e}. Set SHOPIFY_API_KEY and SHOPIFY_API_SECRET.",
+        )
+
+    # Generate new nonce and update customer
+    nonce = oauth.generate_nonce()
+    customer_repo.update(customer.id, {"shopify_nonce": nonce})
+
+    # Redirect to Shopify authorization
+    auth_url = oauth.get_authorization_url(shop, nonce)
+    return RedirectResponse(url=auth_url, status_code=302)
 
 
 # ============================================================================
