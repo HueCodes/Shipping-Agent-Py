@@ -6,7 +6,7 @@ import hmac
 import hashlib
 import base64
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 # Set test environment
 os.environ["SECRET_KEY"] = "test-secret-key-for-testing"
@@ -436,3 +436,278 @@ class TestIntegrationAuth:
         )
         assert response.status_code == 200
         assert response.json()["shop_domain"] == "header-test.myshopify.com"
+
+
+class TestTokenValidation:
+    """Tests for Shopify token validation."""
+
+    @pytest.fixture(scope="class")
+    def setup_database(self):
+        """Set up test database once for all tests in this class."""
+        os.environ["MOCK_MODE"] = "1"
+        os.environ["DATABASE_URL"] = "sqlite:///./test_token_validation.db"
+
+        from sqlalchemy import create_engine
+        from src.db.models import Base
+
+        engine = create_engine(
+            "sqlite:///./test_token_validation.db",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        yield engine
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+        import pathlib
+        pathlib.Path("test_token_validation.db").unlink(missing_ok=True)
+
+    @pytest.fixture
+    def test_client(self, setup_database):
+        """Create test client."""
+        from sqlalchemy.orm import sessionmaker
+        from fastapi.testclient import TestClient
+        from src.server import app, get_db
+
+        TestingSessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=setup_database
+        )
+
+        def override_get_db():
+            db = TestingSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+
+        with TestClient(app) as client:
+            yield client
+
+        app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_validate_access_token_valid(self):
+        """Test validate_access_token with valid token."""
+        from src.auth.shopify import validate_access_token
+
+        # Mock httpx response for valid token
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+
+            mock_instance = AsyncMock()
+            mock_instance.get.return_value = mock_response
+            mock_instance.__aenter__.return_value = mock_instance
+            mock_instance.__aexit__.return_value = None
+            mock_client.return_value = mock_instance
+
+            result = await validate_access_token(
+                "test-store.myshopify.com",
+                "shpat_valid_token"
+            )
+            assert result is True
+
+    @pytest.mark.asyncio
+    async def test_validate_access_token_invalid(self):
+        """Test validate_access_token with invalid/revoked token."""
+        from src.auth.shopify import validate_access_token
+
+        # Mock httpx response for invalid token
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_response = MagicMock()
+            mock_response.status_code = 401  # Unauthorized
+
+            mock_instance = AsyncMock()
+            mock_instance.get.return_value = mock_response
+            mock_instance.__aenter__.return_value = mock_instance
+            mock_instance.__aexit__.return_value = None
+            mock_client.return_value = mock_instance
+
+            result = await validate_access_token(
+                "test-store.myshopify.com",
+                "shpat_invalid_token"
+            )
+            assert result is False
+
+    @pytest.mark.asyncio
+    async def test_validate_access_token_empty_inputs(self):
+        """Test validate_access_token with empty inputs."""
+        from src.auth.shopify import validate_access_token
+
+        assert await validate_access_token("", "token") is False
+        assert await validate_access_token("shop.myshopify.com", "") is False
+        assert await validate_access_token(None, "token") is False
+        assert await validate_access_token("shop.myshopify.com", None) is False
+
+    @pytest.mark.asyncio
+    async def test_validate_access_token_invalid_domain(self):
+        """Test validate_access_token with invalid shop domain."""
+        from src.auth.shopify import validate_access_token
+
+        # Invalid domain format should return False without making request
+        result = await validate_access_token("not-a-shopify-domain.com", "token")
+        assert result is False
+
+    def test_invalid_token_blocks_api_access(self, test_client, setup_database):
+        """Test that customers with invalid tokens are blocked."""
+        from sqlalchemy.orm import sessionmaker
+        from src.db.repository import CustomerRepository
+
+        TestingSessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=setup_database
+        )
+        db = TestingSessionLocal()
+        customer_repo = CustomerRepository(db)
+
+        # Create customer with invalid token flag
+        customer = customer_repo.create({
+            "shop_domain": "invalid-token-test.myshopify.com",
+            "name": "Invalid Token Store",
+            "email": "test@test.com",
+            "token_invalid": 1,  # Mark as invalid
+        })
+        db.commit()
+        customer_id = str(customer.id)
+        db.close()
+
+        # Try to access API - should be blocked
+        response = test_client.get(
+            "/api/me",
+            headers={"X-Customer-ID": customer_id},
+        )
+        assert response.status_code == 401
+        data = response.json()
+        assert "detail" in data
+        detail = data["detail"]
+        assert detail["code"] == "SHOPIFY_TOKEN_INVALID"
+        assert "reconnect" in detail["error"].lower()
+
+    def test_reconnect_flow_clears_invalid_flag(self, test_client, setup_database):
+        """Test that OAuth callback clears the invalid token flag."""
+        from sqlalchemy.orm import sessionmaker
+        from src.db.repository import CustomerRepository
+
+        TestingSessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=setup_database
+        )
+        db = TestingSessionLocal()
+        customer_repo = CustomerRepository(db)
+
+        # Create customer with invalid token flag
+        customer = customer_repo.create({
+            "shop_domain": "reconnect-test.myshopify.com",
+            "name": "Reconnect Test Store",
+            "email": "test@test.com",
+            "token_invalid": 1,
+            "shopify_nonce": "test-nonce-123",  # Set nonce for OAuth callback
+        })
+        db.commit()
+        customer_id = str(customer.id)
+        db.close()
+
+        # Mark token valid (simulating successful OAuth callback)
+        db = TestingSessionLocal()
+        customer_repo = CustomerRepository(db)
+        customer_repo.mark_token_valid(customer.id)
+        db.close()
+
+        # Now should be able to access API
+        response = test_client.get(
+            "/api/me",
+            headers={"X-Customer-ID": customer_id},
+        )
+        assert response.status_code == 200
+
+    def test_reconnect_endpoint_redirects(self, test_client, setup_database):
+        """Test that reconnect endpoint redirects to Shopify OAuth."""
+        from sqlalchemy.orm import sessionmaker
+        from src.db.repository import CustomerRepository
+
+        TestingSessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=setup_database
+        )
+        db = TestingSessionLocal()
+        customer_repo = CustomerRepository(db)
+
+        # Create customer (even with invalid token, reconnect should work)
+        customer = customer_repo.create({
+            "shop_domain": "reconnect-redirect.myshopify.com",
+            "name": "Reconnect Redirect Store",
+            "email": "test@test.com",
+            "token_invalid": 1,
+        })
+        db.commit()
+        customer_id = str(customer.id)
+        db.close()
+
+        # Hit reconnect endpoint
+        response = test_client.get(
+            "/api/shopify/reconnect",
+            headers={"X-Customer-ID": customer_id},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert "myshopify.com" in response.headers["location"]
+        assert "oauth/authorize" in response.headers["location"]
+
+    def test_repository_mark_token_invalid(self, setup_database):
+        """Test CustomerRepository.mark_token_invalid method."""
+        from sqlalchemy.orm import sessionmaker
+        from src.db.repository import CustomerRepository
+
+        TestingSessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=setup_database
+        )
+        db = TestingSessionLocal()
+        customer_repo = CustomerRepository(db)
+
+        # Create customer
+        customer = customer_repo.create({
+            "shop_domain": "mark-invalid-test.myshopify.com",
+            "name": "Mark Invalid Test",
+            "email": "test@test.com",
+        })
+        db.commit()
+
+        # Initially should be valid (0)
+        assert customer.token_invalid == 0
+
+        # Mark as invalid
+        customer_repo.mark_token_invalid(customer.id)
+
+        # Refresh and check
+        db.refresh(customer)
+        assert customer.token_invalid == 1
+        db.close()
+
+    def test_repository_mark_token_valid(self, setup_database):
+        """Test CustomerRepository.mark_token_valid method."""
+        from sqlalchemy.orm import sessionmaker
+        from src.db.repository import CustomerRepository
+
+        TestingSessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=setup_database
+        )
+        db = TestingSessionLocal()
+        customer_repo = CustomerRepository(db)
+
+        # Create customer with invalid token
+        customer = customer_repo.create({
+            "shop_domain": "mark-valid-test.myshopify.com",
+            "name": "Mark Valid Test",
+            "email": "test@test.com",
+            "token_invalid": 1,
+        })
+        db.commit()
+
+        # Mark as valid
+        customer_repo.mark_token_valid(customer.id)
+
+        # Refresh and check
+        db.refresh(customer)
+        assert customer.token_invalid == 0
+        assert customer.token_validated_at is not None
+        db.close()
