@@ -1,8 +1,13 @@
 """SQLAlchemy models for shipping agent."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+
+
+def utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
 
 from sqlalchemy import (
     Column,
@@ -86,8 +91,8 @@ class Customer(Base):
     token_validated_at = Column(DateTime)  # Last time token was verified with Shopify
     token_invalid = Column(Integer, default=0)  # Flag for invalid/revoked tokens (0=valid, 1=invalid)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Relationships
     orders = relationship("Order", back_populates="customer", cascade="all, delete-orphan")
@@ -112,8 +117,8 @@ class Order(Base):
     shipping_address = Column(JSON)
     line_items = Column(JSON)
     weight_oz = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Unique constraint on customer_id + shopify_order_id
     __table_args__ = (
@@ -144,7 +149,7 @@ class Shipment(Base):
     rate_amount = Column(Float)
     status = Column(String(50), default="created")
     estimated_delivery = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     # Relationships
     customer = relationship("Customer", back_populates="shipments")
@@ -163,8 +168,8 @@ class Conversation(Base):
     id = Column(UUID(), primary_key=True, default=uuid.uuid4)
     customer_id = Column(UUID(), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, unique=True)
     messages = Column(JSON, default=list)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Relationships
     customer = relationship("Customer", back_populates="conversations")
@@ -185,7 +190,7 @@ class TrackingEvent(Base):
     description = Column(Text)
     location = Column(JSON)
     occurred_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     # Relationships
     shipment = relationship("Shipment", back_populates="tracking_events")
