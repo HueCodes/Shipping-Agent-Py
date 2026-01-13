@@ -328,7 +328,8 @@ class TestIntegrationAuth:
         from sqlalchemy.orm import sessionmaker
         from fastapi.testclient import TestClient
 
-        from src.server import app, get_db
+        from src.server import app
+        from src.api.deps import get_db
 
         TestingSessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=setup_database
@@ -468,7 +469,8 @@ class TestTokenValidation:
         """Create test client."""
         from sqlalchemy.orm import sessionmaker
         from fastapi.testclient import TestClient
-        from src.server import app, get_db
+        from src.server import app
+        from src.api.deps import get_db
 
         TestingSessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=setup_database
