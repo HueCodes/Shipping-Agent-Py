@@ -67,7 +67,8 @@ def db_session(db_engine):
 def test_client(db_session):
     """Create FastAPI TestClient with test database."""
     # Import here to ensure DATABASE_URL is set
-    from src.server import app, get_db
+    from src.server import app
+    from src.api.deps import get_db
 
     def override_get_db():
         try:
