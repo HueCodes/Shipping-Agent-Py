@@ -1,6 +1,6 @@
 """Repository classes for data access."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -38,7 +38,7 @@ class CustomerRepository:
         if customer:
             for key, value in data.items():
                 setattr(customer, key, value)
-            customer.updated_at = datetime.utcnow()
+            customer.updated_at = datetime.now(timezone.utc)
             self.db.commit()
             self.db.refresh(customer)
         return customer
@@ -48,7 +48,7 @@ class CustomerRepository:
         customer = self.get_by_id(id)
         if customer:
             customer.labels_this_month = count
-            customer.updated_at = datetime.utcnow()
+            customer.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
     def increment_label_count(self, id: UUID, increment: int = 1) -> None:
@@ -56,7 +56,7 @@ class CustomerRepository:
         customer = self.get_by_id(id)
         if customer:
             customer.labels_this_month += increment
-            customer.updated_at = datetime.utcnow()
+            customer.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
     def list_all(self, limit: int = 100) -> list[Customer]:
@@ -68,7 +68,7 @@ class CustomerRepository:
         customer = self.get_by_id(id)
         if customer:
             customer.token_invalid = 1
-            customer.updated_at = datetime.utcnow()
+            customer.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
     def mark_token_valid(self, id: UUID) -> None:
@@ -76,16 +76,16 @@ class CustomerRepository:
         customer = self.get_by_id(id)
         if customer:
             customer.token_invalid = 0
-            customer.token_validated_at = datetime.utcnow()
-            customer.updated_at = datetime.utcnow()
+            customer.token_validated_at = datetime.now(timezone.utc)
+            customer.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
     def update_token_validated_at(self, id: UUID) -> None:
         """Update the token_validated_at timestamp."""
         customer = self.get_by_id(id)
         if customer:
-            customer.token_validated_at = datetime.utcnow()
-            customer.updated_at = datetime.utcnow()
+            customer.token_validated_at = datetime.now(timezone.utc)
+            customer.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
 
@@ -158,7 +158,7 @@ class OrderRepository:
         order = self.get_by_id(id)
         if order:
             order.status = status
-            order.updated_at = datetime.utcnow()
+            order.updated_at = datetime.now(timezone.utc)
             self.db.commit()
             self.db.refresh(order)
         return order
@@ -227,7 +227,7 @@ class ShipmentRepository:
             status=status,
             description=description,
             location=location,
-            occurred_at=occurred_at or datetime.utcnow(),
+            occurred_at=occurred_at or datetime.now(timezone.utc),
         )
         self.db.add(event)
         self.db.commit()
@@ -266,7 +266,7 @@ class ConversationRepository:
             messages = list(conversation.messages) if conversation.messages else []
             messages.append(message)
             conversation.messages = messages
-            conversation.updated_at = datetime.utcnow()
+            conversation.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
     def get_messages(self, id: UUID, limit: int | None = None) -> list[dict]:
@@ -285,7 +285,7 @@ class ConversationRepository:
         conversation = self.get_by_id(id)
         if conversation:
             conversation.messages = []
-            conversation.updated_at = datetime.utcnow()
+            conversation.updated_at = datetime.now(timezone.utc)
             self.db.commit()
 
     def set_messages(self, id: UUID, messages: list[dict]) -> None:
@@ -293,5 +293,5 @@ class ConversationRepository:
         conversation = self.get_by_id(id)
         if conversation:
             conversation.messages = messages
-            conversation.updated_at = datetime.utcnow()
+            conversation.updated_at = datetime.now(timezone.utc)
             self.db.commit()
