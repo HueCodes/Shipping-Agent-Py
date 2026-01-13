@@ -1,7 +1,7 @@
 """Seed script for demo data."""
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -192,7 +192,7 @@ def seed_demo_orders(db: Session, customer_id: uuid.UUID) -> list[Order]:
     order_repo = OrderRepository(db)
 
     created_orders = []
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     for order_data in DEMO_ORDERS:
         # Check if order already exists
