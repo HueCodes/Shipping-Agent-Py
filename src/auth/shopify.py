@@ -1,4 +1,4 @@
-"""Shopify OAuth 2.0 implementation."""
+"""Shopify OAuth 2.0 implementation and Admin API client."""
 
 import os
 import re
@@ -6,11 +6,16 @@ import hmac
 import hashlib
 import base64
 import secrets
+import logging
 from urllib.parse import urlencode, parse_qs
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+from datetime import datetime
 
 import httpx
+
+
+logger = logging.getLogger(__name__)
 
 
 # Shopify OAuth endpoints
@@ -312,3 +317,340 @@ async def validate_access_token(shop: str, access_token: str) -> bool:
     except Exception:
         # Network or other error - can't determine, assume valid
         return True
+
+
+# Shopify Admin API version
+SHOPIFY_API_VERSION = "2024-01"
+
+
+@dataclass
+class ShopifyOrder:
+    """Parsed Shopify order data."""
+
+    id: str  # Shopify order ID (numeric string)
+    order_number: str  # Human-readable order number (e.g., "#1001")
+    name: str  # Display name (e.g., "#1001")
+    email: str | None
+    fulfillment_status: str | None  # null, "fulfilled", "partial"
+    financial_status: str  # "paid", "pending", etc.
+    shipping_address: dict | None
+    line_items: list[dict]
+    total_weight: int  # Weight in grams
+    created_at: str
+    updated_at: str
+    cancelled_at: str | None = None
+
+
+@dataclass
+class ShopifyFulfillment:
+    """Parsed Shopify fulfillment data."""
+
+    id: str
+    order_id: str
+    status: str
+    tracking_number: str | None
+    tracking_url: str | None
+    tracking_company: str | None
+
+
+class ShopifyAdminClient:
+    """Shopify Admin API client for order and fulfillment operations."""
+
+    def __init__(self, shop: str, access_token: str):
+        """Initialize the Admin API client.
+
+        Args:
+            shop: Shopify store domain (e.g., store.myshopify.com)
+            access_token: Shopify access token (decrypted)
+        """
+        self.shop = shop
+        self.access_token = access_token
+        self.base_url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}"
+
+    def _headers(self) -> dict[str, str]:
+        """Get headers for API requests."""
+        return {
+            "X-Shopify-Access-Token": self.access_token,
+            "Content-Type": "application/json",
+        }
+
+    async def get_orders(
+        self,
+        status: str = "unfulfilled",
+        limit: int = 50,
+        since_id: str | None = None,
+        created_at_min: datetime | None = None,
+    ) -> list[ShopifyOrder]:
+        """Fetch orders from Shopify.
+
+        Args:
+            status: Fulfillment status filter ("unfulfilled", "any", "fulfilled")
+            limit: Maximum number of orders to return (max 250)
+            since_id: Only return orders after this ID
+            created_at_min: Only return orders created after this time
+
+        Returns:
+            List of ShopifyOrder objects
+        """
+        params = {
+            "status": "any",  # Get all orders regardless of financial status
+            "limit": min(limit, 250),
+        }
+
+        if status == "unfulfilled":
+            params["fulfillment_status"] = "unfulfilled"
+        elif status == "fulfilled":
+            params["fulfillment_status"] = "shipped"
+
+        if since_id:
+            params["since_id"] = since_id
+        if created_at_min:
+            params["created_at_min"] = created_at_min.isoformat()
+
+        url = f"{self.base_url}/orders.json"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._headers(), params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        orders = []
+        for o in data.get("orders", []):
+            orders.append(self._parse_order(o))
+        return orders
+
+    async def get_order(self, order_id: str) -> ShopifyOrder | None:
+        """Fetch a single order by ID.
+
+        Args:
+            order_id: Shopify order ID
+
+        Returns:
+            ShopifyOrder object or None if not found
+        """
+        url = f"{self.base_url}/orders/{order_id}.json"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._headers())
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            data = response.json()
+
+        return self._parse_order(data.get("order", {}))
+
+    def _parse_order(self, data: dict) -> ShopifyOrder:
+        """Parse Shopify order JSON into ShopifyOrder object."""
+        # Calculate total weight from line items
+        total_weight = 0
+        line_items = []
+        for item in data.get("line_items", []):
+            total_weight += item.get("grams", 0) * item.get("quantity", 1)
+            line_items.append({
+                "id": str(item.get("id")),
+                "title": item.get("title"),
+                "quantity": item.get("quantity", 1),
+                "price": item.get("price"),
+                "sku": item.get("sku"),
+                "grams": item.get("grams", 0),
+                "variant_title": item.get("variant_title"),
+            })
+
+        # Parse shipping address
+        shipping_address = None
+        if data.get("shipping_address"):
+            addr = data["shipping_address"]
+            shipping_address = {
+                "name": addr.get("name"),
+                "street1": addr.get("address1"),
+                "street2": addr.get("address2"),
+                "city": addr.get("city"),
+                "state": addr.get("province_code"),
+                "zip": addr.get("zip"),
+                "country": addr.get("country_code", "US"),
+                "phone": addr.get("phone"),
+            }
+
+        return ShopifyOrder(
+            id=str(data.get("id")),
+            order_number=data.get("order_number", ""),
+            name=data.get("name", ""),
+            email=data.get("email"),
+            fulfillment_status=data.get("fulfillment_status"),
+            financial_status=data.get("financial_status", ""),
+            shipping_address=shipping_address,
+            line_items=line_items,
+            total_weight=total_weight,
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+            cancelled_at=data.get("cancelled_at"),
+        )
+
+    async def create_fulfillment(
+        self,
+        order_id: str,
+        tracking_number: str,
+        tracking_company: str,
+        tracking_url: str | None = None,
+        line_item_ids: list[str] | None = None,
+        notify_customer: bool = True,
+    ) -> ShopifyFulfillment:
+        """Create a fulfillment for an order in Shopify.
+
+        This marks the order (or specific line items) as shipped and sends
+        tracking info to the customer.
+
+        Args:
+            order_id: Shopify order ID
+            tracking_number: Carrier tracking number
+            tracking_company: Carrier name (e.g., "USPS", "UPS", "FedEx")
+            tracking_url: Optional tracking URL
+            line_item_ids: Specific line items to fulfill (None = all)
+            notify_customer: Whether to send shipment notification email
+
+        Returns:
+            ShopifyFulfillment object
+
+        Raises:
+            httpx.HTTPStatusError: If the API call fails
+        """
+        # First, get the fulfillment order for this order
+        fulfillment_orders = await self._get_fulfillment_orders(order_id)
+        if not fulfillment_orders:
+            raise ValueError(f"No fulfillment orders found for order {order_id}")
+
+        # Get the first open fulfillment order
+        fulfillment_order = None
+        for fo in fulfillment_orders:
+            if fo.get("status") == "open":
+                fulfillment_order = fo
+                break
+
+        if not fulfillment_order:
+            raise ValueError(f"No open fulfillment orders for order {order_id}")
+
+        fulfillment_order_id = fulfillment_order["id"]
+
+        # Build line items payload
+        line_items_payload = []
+        for item in fulfillment_order.get("line_items", []):
+            if line_item_ids is None or str(item.get("line_item_id")) in line_item_ids:
+                line_items_payload.append({
+                    "id": item["id"],
+                    "quantity": item["quantity"],
+                })
+
+        # Create fulfillment using the new fulfillment API
+        url = f"{self.base_url}/fulfillments.json"
+        payload = {
+            "fulfillment": {
+                "line_items_by_fulfillment_order": [
+                    {
+                        "fulfillment_order_id": fulfillment_order_id,
+                        "fulfillment_order_line_items": line_items_payload,
+                    }
+                ],
+                "tracking_info": {
+                    "number": tracking_number,
+                    "company": tracking_company,
+                },
+                "notify_customer": notify_customer,
+            }
+        }
+
+        if tracking_url:
+            payload["fulfillment"]["tracking_info"]["url"] = tracking_url
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=self._headers(), json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        fulfillment = data.get("fulfillment", {})
+        return ShopifyFulfillment(
+            id=str(fulfillment.get("id")),
+            order_id=order_id,
+            status=fulfillment.get("status", ""),
+            tracking_number=tracking_number,
+            tracking_url=tracking_url,
+            tracking_company=tracking_company,
+        )
+
+    async def _get_fulfillment_orders(self, order_id: str) -> list[dict]:
+        """Get fulfillment orders for a Shopify order.
+
+        Args:
+            order_id: Shopify order ID
+
+        Returns:
+            List of fulfillment order objects
+        """
+        url = f"{self.base_url}/orders/{order_id}/fulfillment_orders.json"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._headers())
+            response.raise_for_status()
+            data = response.json()
+
+        return data.get("fulfillment_orders", [])
+
+    async def register_webhooks(self, app_url: str) -> list[dict]:
+        """Register webhooks for order events.
+
+        Args:
+            app_url: Base URL of the app (e.g., https://myapp.com)
+
+        Returns:
+            List of created webhook objects
+        """
+        webhooks_to_register = [
+            {"topic": "orders/create", "address": f"{app_url}/webhooks/shopify/orders"},
+            {"topic": "orders/updated", "address": f"{app_url}/webhooks/shopify/orders"},
+            {"topic": "orders/cancelled", "address": f"{app_url}/webhooks/shopify/orders"},
+        ]
+
+        created = []
+        url = f"{self.base_url}/webhooks.json"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for webhook in webhooks_to_register:
+                payload = {
+                    "webhook": {
+                        "topic": webhook["topic"],
+                        "address": webhook["address"],
+                        "format": "json",
+                    }
+                }
+                try:
+                    response = await client.post(url, headers=self._headers(), json=payload)
+                    if response.status_code == 201:
+                        created.append(response.json().get("webhook", {}))
+                        logger.info("Registered webhook: %s", webhook["topic"])
+                    elif response.status_code == 422:
+                        # Webhook already exists
+                        logger.info("Webhook already exists: %s", webhook["topic"])
+                    else:
+                        logger.warning(
+                            "Failed to register webhook %s: %s",
+                            webhook["topic"],
+                            response.text,
+                        )
+                except Exception as e:
+                    logger.error("Error registering webhook %s: %s", webhook["topic"], e)
+
+        return created
+
+    async def list_webhooks(self) -> list[dict]:
+        """List all registered webhooks.
+
+        Returns:
+            List of webhook objects
+        """
+        url = f"{self.base_url}/webhooks.json"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._headers())
+            response.raise_for_status()
+            data = response.json()
+
+        return data.get("webhooks", [])
