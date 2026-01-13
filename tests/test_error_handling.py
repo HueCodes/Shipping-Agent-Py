@@ -40,7 +40,8 @@ class TestErrorResponseFormat:
         """Create test client with database override."""
         from sqlalchemy.orm import sessionmaker
         from fastapi.testclient import TestClient
-        from src.server import app, get_db
+        from src.server import app
+        from src.api.deps import get_db
 
         TestingSessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=setup_database
@@ -98,12 +99,14 @@ class TestErrorResponseFormat:
             json={"message": "", "session_id": "test"},
             headers={"X-Customer-ID": customer_with_db},
         )
-        assert response.status_code == 400
+        # 422 Unprocessable Entity for Pydantic validation errors
+        assert response.status_code == 422
         data = response.json()
         assert "detail" in data
-        detail = data["detail"]
-        assert detail["code"] == "VALIDATION_ERROR"
-        assert "error" in detail
+        # Pydantic returns a list of validation errors
+        assert isinstance(data["detail"], list)
+        assert len(data["detail"]) > 0
+        assert "msg" in data["detail"][0]
 
     def test_not_found_error_format(self, test_client, customer_with_db):
         """Test not found error returns consistent format."""
@@ -148,7 +151,8 @@ class TestEasyPostErrorHandling:
         """Create test client."""
         from sqlalchemy.orm import sessionmaker
         from fastapi.testclient import TestClient
-        from src.server import app, get_db
+        from src.server import app
+        from src.api.deps import get_db
 
         TestingSessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=setup_database
@@ -193,7 +197,7 @@ class TestEasyPostErrorHandling:
         """Test that rate errors don't expose internal API details."""
         from src.easypost_client import RateError
 
-        with patch("src.server.get_easypost_client") as mock_get_client:
+        with patch("src.api.shipping.get_easypost_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.get_rates.side_effect = RateError(
                 message="Unable to fetch shipping rates. Please verify the address and try again.",
@@ -230,7 +234,7 @@ class TestEasyPostErrorHandling:
         """Test address validation error handling."""
         from src.easypost_client import AddressValidationError
 
-        with patch("src.server.get_easypost_client") as mock_get_client:
+        with patch("src.api.shipping.get_easypost_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.validate_address.side_effect = AddressValidationError(
                 message="An error occurred while validating the address.",
@@ -260,7 +264,7 @@ class TestEasyPostErrorHandling:
         """Test shipment creation error handling."""
         from src.easypost_client import ShipmentError
 
-        with patch("src.server.get_easypost_client") as mock_get_client:
+        with patch("src.api.shipping.get_easypost_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.create_shipment.side_effect = ShipmentError(
                 message="Unable to purchase shipping label. The rate may have expired.",
@@ -322,7 +326,7 @@ class TestEasyPostErrorHandling:
         shipment_id = str(shipment.id)
         db.close()
 
-        with patch("src.server.get_easypost_client") as mock_get_client:
+        with patch("src.api.shipping.get_easypost_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.get_tracking.side_effect = TrackingError(
                 message="Tracking number not found. Please verify the number is correct.",
@@ -370,7 +374,8 @@ class TestChatErrorHandling:
         """Create test client."""
         from sqlalchemy.orm import sessionmaker
         from fastapi.testclient import TestClient
-        from src.server import app, get_db
+        from src.server import app
+        from src.api.deps import get_db
 
         TestingSessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=setup_database
@@ -396,11 +401,13 @@ class TestChatErrorHandling:
             "/api/chat",
             json={"message": "   ", "session_id": "test"},
         )
-        assert response.status_code == 400
+        # 422 Unprocessable Entity for Pydantic validation errors
+        assert response.status_code == 422
         data = response.json()
-        detail = data["detail"]
-        assert detail["code"] == "VALIDATION_ERROR"
-        assert "empty" in detail["error"].lower()
+        # Pydantic validation error format
+        assert "detail" in data
+        assert isinstance(data["detail"], list)
+        assert "empty" in str(data["detail"]).lower()
 
     def test_chat_error_does_not_expose_api_keys(self, test_client, setup_database):
         """Test that chat errors don't expose API keys."""
@@ -421,7 +428,7 @@ class TestChatErrorHandling:
         customer_id = str(customer.id)
         db.close()
 
-        with patch("src.server.agents", {}):
+        with patch("src.api.chat.agents", {}):
             with patch("src.agent.ShippingAgent") as mock_agent_class:
                 mock_agent = MagicMock()
                 mock_agent.chat.side_effect = Exception(
@@ -473,7 +480,8 @@ class TestMalformedRequestHandling:
         """Create test client."""
         from sqlalchemy.orm import sessionmaker
         from fastapi.testclient import TestClient
-        from src.server import app, get_db
+        from src.server import app
+        from src.api.deps import get_db
 
         TestingSessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=setup_database
