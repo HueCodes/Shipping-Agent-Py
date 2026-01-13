@@ -34,7 +34,8 @@ class TestBasicChat:
             "/api/chat",
             json={"message": "", "session_id": "test"},
         )
-        assert response.status_code == 400
+        # 422 Unprocessable Entity for Pydantic validation errors
+        assert response.status_code == 422
 
 
 class TestMultiTurnConversation:
