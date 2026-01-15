@@ -81,20 +81,35 @@ app.include_router(shipping_router)
 app.include_router(webhooks_router)
 
 
-# Static files
+# Static files - try React build first, then fall back to legacy static
+react_dist = Path(__file__).parent.parent / "frontend" / "dist"
 static_dir = Path(__file__).parent / "static"
-if static_dir.exists():
+
+if react_dist.exists():
+    # Mount React assets
+    assets_dir = react_dist / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+elif static_dir.exists():
+    # Fall back to legacy static files
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     """Serve the main chat UI."""
-    index_file = static_dir / "index.html"
-    if index_file.exists():
-        return FileResponse(index_file)
+    # Try React build first
+    react_index = react_dist / "index.html"
+    if react_index.exists():
+        return FileResponse(react_index)
+
+    # Fall back to legacy static
+    legacy_index = static_dir / "index.html"
+    if legacy_index.exists():
+        return FileResponse(legacy_index)
+
     return HTMLResponse(
-        content="<h1>Shipping Agent</h1><p>Static files not found. Run from project root.</p>",
+        content="<h1>Shipping Agent</h1><p>Run 'cd frontend && npm run build' to build the UI.</p>",
         status_code=200,
     )
 
